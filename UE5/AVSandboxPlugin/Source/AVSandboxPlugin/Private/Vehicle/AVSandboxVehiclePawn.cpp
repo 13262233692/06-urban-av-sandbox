@@ -6,6 +6,7 @@
 #include "DrawDebugHelpers.h"
 #include "Kismet/GameplayStatics.h"
 #include "PhysicsEngine/PhysicsSettings.h"
+#include "Lidar/PointCloud2Builder.h"
 
 AAVSandboxVehiclePawn::AAVSandboxVehiclePawn()
 {
@@ -20,6 +21,10 @@ AAVSandboxVehiclePawn::AAVSandboxVehiclePawn()
 	UDPSocket = CreateDefaultSubobject<UUDPSocketComponent>(TEXT("UDPSocket"));
 
 	StateInterpolator = CreateDefaultSubobject<UVehicleStateInterpolator>(TEXT("StateInterpolator"));
+
+	LidarSensor = CreateDefaultSubobject<ULidarSensorComponent>(TEXT("LidarSensor"));
+
+	LidarStreamer = CreateDefaultSubobject<ULidarTCPStreamer>(TEXT("LidarStreamer"));
 
 	SpringArm = CreateDefaultSubobject<USpringArmComponent>(TEXT("SpringArm"));
 	SpringArm->SetupAttachment(RootComponent);
@@ -63,6 +68,17 @@ void AAVSandboxVehiclePawn::EndPlay(const EEndPlayReason::Reason EndPlayReason)
 	{
 		UDPSocket->OnControlMessageReceived.RemoveDynamic(this, &AAVSandboxVehiclePawn::HandleControlMessage);
 		UDPSocket->CloseSockets();
+	}
+
+	if (LidarSensor)
+	{
+		LidarSensor->OnLidarScanComplete.RemoveDynamic(this, &AAVSandboxVehiclePawn::HandleLidarScanComplete);
+		LidarSensor->StopScanning();
+	}
+
+	if (LidarStreamer)
+	{
+		LidarStreamer->StopServer();
 	}
 
 	Super::EndPlay(EndPlayReason);
@@ -536,4 +552,55 @@ int32 AAVSandboxVehiclePawn::FindClosestLaneNode() const
 	}
 
 	return BestNode;
+}
+
+void AAVSandboxVehiclePawn::InitializeLidar(const FLidarConfig& InConfig)
+{
+	if (LidarSensor)
+	{
+		LidarSensor->Initialize(InConfig);
+		LidarSensor->OnLidarScanComplete.AddDynamic(this, &AAVSandboxVehiclePawn::HandleLidarScanComplete);
+	}
+
+	if (LidarStreamer)
+	{
+		LidarStreamer->StartServer(InConfig.TCPPort, InConfig.MaxTCPClients);
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("[AVSandboxVehicle] LiDAR initialized: %d channels, %d pts/ch, TCP port %d"),
+		InConfig.ChannelCount, InConfig.PointsPerChannel, InConfig.TCPPort);
+}
+
+void AAVSandboxVehiclePawn::StartLidarScanning()
+{
+	if (LidarSensor)
+	{
+		LidarSensor->StartScanning();
+	}
+}
+
+void AAVSandboxVehiclePawn::StopLidarScanning()
+{
+	if (LidarSensor)
+	{
+		LidarSensor->StopScanning();
+	}
+}
+
+FLidarScanFrame AAVSandboxVehiclePawn::GetLatestLidarFrame() const
+{
+	if (LidarSensor)
+	{
+		return LidarSensor->GetLatestFrame();
+	}
+	return FLidarScanFrame();
+}
+
+void AAVSandboxVehiclePawn::HandleLidarScanComplete(const FLidarScanFrame& Frame)
+{
+	if (LidarStreamer && LidarStreamer->IsServerRunning())
+	{
+		TArray<uint8> PointCloud2Data = UPointCloud2Builder::BuildPointCloud2MessageXYZIR(Frame, TEXT("lidar"));
+		LidarStreamer->BroadcastPointCloud2(PointCloud2Data);
+	}
 }

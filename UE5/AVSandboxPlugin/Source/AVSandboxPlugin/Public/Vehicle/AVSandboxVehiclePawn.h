@@ -7,6 +7,8 @@
 #include "Vehicle/VehicleControlProtocol.h"
 #include "Vehicle/VehicleStateProtocol.h"
 #include "Vehicle/VehicleStateInterpolator.h"
+#include "Lidar/LidarSensorComponent.h"
+#include "Lidar/LidarTCPStreamer.h"
 #include "LaneGraph/LaneGraphTypes.h"
 #include "AVSandboxVehiclePawn.generated.h"
 
@@ -33,6 +35,12 @@ public:
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AVSandbox|Vehicle")
 	UVehicleStateInterpolator* StateInterpolator;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AVSandbox|Lidar")
+	ULidarSensorComponent* LidarSensor;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AVSandbox|Lidar")
+	ULidarTCPStreamer* LidarStreamer;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AVSandbox|Vehicle")
 	USpringArmComponent* SpringArm;
@@ -145,6 +153,18 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "AVSandbox|TimeDilation")
 	void ConfigurePhysicsForTimeDilation(float Dilation);
 
+	UFUNCTION(BlueprintCallable, Category = "AVSandbox|Lidar")
+	void InitializeLidar(const FLidarConfig& InConfig);
+
+	UFUNCTION(BlueprintCallable, Category = "AVSandbox|Lidar")
+	void StartLidarScanning();
+
+	UFUNCTION(BlueprintCallable, Category = "AVSandbox|Lidar")
+	void StopLidarScanning();
+
+	UFUNCTION(BlueprintCallable, Category = "AVSandbox|Lidar")
+	FLidarScanFrame GetLatestLidarFrame() const;
+
 	UFUNCTION(BlueprintImplementableEvent, Category = "AVSandbox|Vehicle")
 	void OnControlReceived(const FVehicleControlMessage& Control);
 
@@ -157,6 +177,9 @@ public:
 protected:
 	UFUNCTION()
 	void HandleControlMessage(const FVehicleControlMessage& Message);
+
+	UFUNCTION()
+	void HandleLidarScanComplete(const FLidarScanFrame& Frame);
 
 private:
 	const FLaneGraph* CachedLaneGraph;
