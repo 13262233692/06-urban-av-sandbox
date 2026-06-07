@@ -1,0 +1,19 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0.0",
+	"FriendlyName": "AV Sandbox Plugin",
+	"Description": "L4 Autonomous Driving Simulation Sandbox - OpenDRIVE Map Parser, Lane Topology, Chaos Vehicle UDP Sync",
+	"Category": "Simulation",
+	"CreatedBy": "AVSandbox",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "AVSandboxPlugin",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}
