@@ -13,6 +13,8 @@ UUDPSocketComponent::UUDPSocketComponent()
 	ListenSocket = nullptr;
 	SendSocket = nullptr;
 	bHasPendingControl = false;
+	HighestDeliveredSequence = 0;
+	DrainAccumulator = 0.0f;
 	ReceiveBuffer.SetNumUninitialized(FVehicleControlMessage::SERIALIZED_SIZE + 64);
 }
 
@@ -30,6 +32,12 @@ void UUDPSocketComponent::EndPlay(const EEndPlayReason::Reason EndPlayReason)
 {
 	CloseSockets();
 	Super::EndPlay(EndPlayReason);
+}
+
+bool UUDPSocketComponent::IsSequenceNewer(uint16 Incoming, uint16 Reference)
+{
+	int32 Diff = static_cast<int32>(Incoming) - static_cast<int32>(Reference);
+	return Diff > 0 && Diff < 32768;
 }
 
 bool UUDPSocketComponent::InitializeListenSocket(int32 InListenPort)
@@ -66,7 +74,8 @@ bool UUDPSocketComponent::InitializeListenSocket(int32 InListenPort)
 	ListenSocket->SetNonBlocking(true);
 	bIsListening = true;
 
-	UE_LOG(LogTemp, Log, TEXT("[UDPSocket] Listening on port %d"), ListenPort);
+	UE_LOG(LogTemp, Log, TEXT("[UDPSocket] Listening on port %d (mode=%s)"),
+		ListenPort, DeliveryMode == EUDPDeliveryMode::Immediate ? TEXT("Immediate") : TEXT("BufferedOrdered"));
 	return true;
 }
 
@@ -142,6 +151,8 @@ void UUDPSocketComponent::CloseSockets()
 		SendSocket = nullptr;
 		bIsSending = false;
 	}
+
+	OrderedBuffer.Empty();
 }
 
 void UUDPSocketComponent::ProcessIncomingData()
@@ -174,21 +185,88 @@ void UUDPSocketComponent::ProcessIncomingData()
 			FVehicleControlMessage CtrlMsg;
 			if (FVehicleControlMessage::Deserialize(MsgBytes, CtrlMsg))
 			{
-				if (CtrlMsg.VerifyChecksum())
+				if (!CtrlMsg.VerifyChecksum())
+				{
+					UE_LOG(LogTemp, Warning, TEXT("[UDPSocket] Control message checksum mismatch"));
+					continue;
+				}
+
+				MessagesReceived++;
+				LastReceivedSequence = CtrlMsg.SequenceNumber;
+
+				if (DeliveryMode == EUDPDeliveryMode::Immediate)
 				{
 					FScopeLock Lock(&ControlMutex);
 					PendingControl = CtrlMsg;
 					bHasPendingControl = true;
-					MessagesReceived++;
-					LastReceivedSequence = CtrlMsg.SequenceNumber;
 				}
 				else
 				{
-					UE_LOG(LogTemp, Warning, TEXT("[UDPSocket] Control message checksum mismatch"));
+					FScopeLock Lock(&ControlMutex);
+
+					if (bDropOutOfOrder && HighestDeliveredSequence > 0)
+					{
+						if (!IsSequenceNewer(CtrlMsg.SequenceNumber, HighestDeliveredSequence))
+						{
+							DroppedOutOfOrder++;
+							continue;
+						}
+					}
+
+					int32 InsertIdx = 0;
+					for (int32 i = OrderedBuffer.Num() - 1; i >= 0; --i)
+					{
+						if (IsSequenceNewer(OrderedBuffer[i].SequenceNumber, CtrlMsg.SequenceNumber))
+						{
+							InsertIdx = i + 1;
+							break;
+						}
+					}
+
+					OrderedBuffer.Insert(CtrlMsg, InsertIdx);
+
+					if (OrderedBuffer.Num() > MaxBufferSize)
+					{
+						OrderedBuffer.RemoveAt(0, OrderedBuffer.Num() - MaxBufferSize);
+					}
+
+					BufferQueueSize = OrderedBuffer.Num();
 				}
 			}
 		}
 	}
+}
+
+void UUDPSocketComponent::ProcessOrderedBuffer()
+{
+	if (OrderedBuffer.Num() == 0) return;
+
+	FScopeLock Lock(&ControlMutex);
+
+	int32 DeliverCount = 0;
+	if (BufferDrainInterval <= 0.0f)
+	{
+		DeliverCount = 1;
+	}
+	else
+	{
+		DeliverCount = FMath::Max(1, FMath::FloorToInt(DrainAccumulator / BufferDrainInterval));
+	}
+
+	for (int32 i = 0; i < DeliverCount && OrderedBuffer.Num() > 0; ++i)
+	{
+		FVehicleControlMessage Msg = OrderedBuffer[0];
+		OrderedBuffer.RemoveAt(0);
+
+		HighestDeliveredSequence = Msg.SequenceNumber;
+
+		PendingControl = Msg;
+		bHasPendingControl = true;
+
+		OnControlMessageReceived.Broadcast(Msg);
+	}
+
+	BufferQueueSize = OrderedBuffer.Num();
 }
 
 void UUDPSocketComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
@@ -197,6 +275,13 @@ void UUDPSocketComponent::TickComponent(float DeltaTime, ELevelTick TickType, FA
 
 	ProcessIncomingData();
 
+	if (DeliveryMode == EUDPDeliveryMode::BufferedOrdered)
+	{
+		DrainAccumulator += DeltaTime;
+		ProcessOrderedBuffer();
+		DrainAccumulator = FMath::Fmod(DrainAccumulator, FMath::Max(BufferDrainInterval, 0.001f));
+	}
+	else
 	{
 		FScopeLock Lock(&ControlMutex);
 		if (bHasPendingControl)

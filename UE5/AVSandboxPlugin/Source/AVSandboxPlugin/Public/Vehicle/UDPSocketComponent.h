@@ -10,6 +10,13 @@
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnControlMessageReceived, const FVehicleControlMessage&, Message);
 
+UENUM(BlueprintType)
+enum class EUDPDeliveryMode : uint8
+{
+	Immediate,
+	BufferedOrdered
+};
+
 UCLASS(BlueprintType, ClassGroup = (AVSandbox), meta = (BlueprintSpawnableComponent))
 class UUDPSocketComponent : public UActorComponent
 {
@@ -53,6 +60,18 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AVSandbox|UDP")
 	int32 ReceiveBufferSize = 65536;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AVSandbox|UDP")
+	EUDPDeliveryMode DeliveryMode = EUDPDeliveryMode::BufferedOrdered;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AVSandbox|UDP")
+	int32 MaxBufferSize = 256;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AVSandbox|UDP")
+	float BufferDrainInterval = 0.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AVSandbox|UDP")
+	bool bDropOutOfOrder = true;
+
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AVSandbox|UDP")
 	bool bIsListening = false;
 
@@ -71,6 +90,12 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AVSandbox|UDP")
 	float LastReceivedTimestamp = 0.0f;
 
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AVSandbox|UDP")
+	int32 DroppedOutOfOrder = 0;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AVSandbox|UDP")
+	int32 BufferQueueSize = 0;
+
 private:
 	FSocket* ListenSocket;
 	FSocket* SendSocket;
@@ -79,10 +104,19 @@ private:
 	FVehicleControlMessage PendingControl;
 	bool bHasPendingControl;
 
+	TArray<FVehicleControlMessage> OrderedBuffer;
+
+	uint16 HighestDeliveredSequence;
+
 	FCriticalSection ControlMutex;
 
 	TArray<uint8> ReceiveBuffer;
 
+	float DrainAccumulator;
+
 	void ProcessIncomingData();
+	void ProcessOrderedBuffer();
 	bool SendDataInternal(const uint8* Data, int32 Size);
+
+	static bool IsSequenceNewer(uint16 Incoming, uint16 Reference);
 };

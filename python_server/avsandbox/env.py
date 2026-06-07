@@ -14,7 +14,7 @@ except ImportError:
     MultiAgentEnv = object
 
 from avsandbox.config import AVSandboxConfig
-from avsandbox.protocol import VehicleControlMessage, VehicleStateMessage
+from avsandbox.protocol import VehicleControlMessage, VehicleStateMessage, StateSmoother
 from avsandbox.udp_transport import UDPTransport
 from avsandbox.open_drive_proxy import OpenDriveProxy
 
@@ -53,6 +53,8 @@ class AVSandboxEnv(gym.Env if not HAS_RAY else MultiAgentEnv):
         self._episode_start_time: float = 0.0
         self._done: bool = False
         self._info: Dict[str, Any] = {}
+        self._state_smoother: Optional[StateSmoother] = None
+        self._time_dilation: float = 1.0
 
         self._open_drive: Optional[OpenDriveProxy] = None
         if self._config.open_drive_map_path:
@@ -81,6 +83,11 @@ class AVSandboxEnv(gym.Env if not HAS_RAY else MultiAgentEnv):
         self._done = False
         self._prev_distance = 0.0
         self._info = {}
+        self._state_smoother = StateSmoother(
+            smoothing_factor=0.3,
+            max_position_jump=50.0,
+            max_velocity_jump=500.0,
+        )
 
         transport = self._ensure_transport()
 
@@ -90,6 +97,8 @@ class AVSandboxEnv(gym.Env if not HAS_RAY else MultiAgentEnv):
             steering_angle=0.0,
             gear=0,
             handbrake=1,
+            sim_timestamp=time.time(),
+            time_dilation=self._time_dilation,
         )
         transport.send_control(reset_control)
 
@@ -117,12 +126,17 @@ class AVSandboxEnv(gym.Env if not HAS_RAY else MultiAgentEnv):
             throttle=throttle,
             brake=brake,
             steering_angle=steering,
+            sim_timestamp=time.time(),
+            time_dilation=self._time_dilation,
         )
         transport.send_control(control)
 
         self._current_state = transport.receive_state(timeout=self._config.state_recv_timeout)
         if self._current_state is None:
             self._current_state = VehicleStateMessage()
+
+        if self._state_smoother is not None:
+            self._current_state = self._state_smoother.smooth(self._current_state)
 
         self._step_count += 1
 
@@ -150,11 +164,15 @@ class AVSandboxEnv(gym.Env if not HAS_RAY else MultiAgentEnv):
     def close(self) -> None:
         if self._transport is not None:
             stop_control = VehicleControlMessage(
-                throttle=0.0, brake=1.0, steering_angle=0.0, handbrake=1
+                throttle=0.0, brake=1.0, steering_angle=0.0, handbrake=1,
+                sim_timestamp=time.time(), time_dilation=self._time_dilation,
             )
             self._transport.send_control(stop_control)
             self._transport.stop()
             self._transport = None
+
+    def set_time_dilation(self, dilation: float) -> None:
+        self._time_dilation = max(dilation, 0.1)
 
     def _state_to_observation(self, state: VehicleStateMessage) -> np.ndarray:
         raw = state.to_observation()

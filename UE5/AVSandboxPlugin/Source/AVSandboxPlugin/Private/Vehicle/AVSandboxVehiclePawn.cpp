@@ -5,6 +5,7 @@
 #include "Engine/World.h"
 #include "DrawDebugHelpers.h"
 #include "Kismet/GameplayStatics.h"
+#include "PhysicsEngine/PhysicsSettings.h"
 
 AAVSandboxVehiclePawn::AAVSandboxVehiclePawn()
 {
@@ -18,6 +19,8 @@ AAVSandboxVehiclePawn::AAVSandboxVehiclePawn()
 
 	UDPSocket = CreateDefaultSubobject<UUDPSocketComponent>(TEXT("UDPSocket"));
 
+	StateInterpolator = CreateDefaultSubobject<UVehicleStateInterpolator>(TEXT("StateInterpolator"));
+
 	SpringArm = CreateDefaultSubobject<USpringArmComponent>(TEXT("SpringArm"));
 	SpringArm->SetupAttachment(RootComponent);
 	SpringArm->TargetArmLength = 600.0f;
@@ -28,6 +31,7 @@ AAVSandboxVehiclePawn::AAVSandboxVehiclePawn()
 	Camera->bUsePawnControlRotation = false;
 
 	CachedLaneGraph = nullptr;
+	bHasLastReportedState = false;
 }
 
 void AAVSandboxVehiclePawn::BeginPlay()
@@ -41,7 +45,16 @@ void AAVSandboxVehiclePawn::BeginPlay()
 		UDPSocket->OnControlMessageReceived.AddDynamic(this, &AAVSandboxVehiclePawn::HandleControlMessage);
 	}
 
+	if (StateInterpolator)
+	{
+		StateInterpolator->SetTimeDilation(TargetTimeDilation);
+	}
+
 	PreviousVelocity = GetVelocity();
+	SmoothedPosition = GetActorLocation();
+	SmoothedVelocity = GetVelocity();
+
+	ConfigurePhysicsForTimeDilation(TargetTimeDilation);
 }
 
 void AAVSandboxVehiclePawn::EndPlay(const EEndPlayReason::Reason EndPlayReason)
@@ -57,7 +70,16 @@ void AAVSandboxVehiclePawn::EndPlay(const EEndPlayReason::Reason EndPlayReason)
 
 void AAVSandboxVehiclePawn::HandleControlMessage(const FVehicleControlMessage& Message)
 {
-	ApplyControl(Message);
+	if (StateInterpolator)
+	{
+		double SimTime = GetWorld()->GetTimeSeconds();
+		StateInterpolator->EnqueueControl(Message, SimTime);
+	}
+	else
+	{
+		ApplyControl(Message);
+	}
+
 	OnControlReceived(Message);
 }
 
@@ -66,6 +88,33 @@ void AAVSandboxVehiclePawn::ApplyControl(const FVehicleControlMessage& Control)
 	CurrentControl = Control;
 	ControlSequenceNumber = Control.SequenceNumber;
 	ApplyControlToChaosVehicle(Control);
+}
+
+void AAVSandboxVehiclePawn::ApplySmoothedControlToChaosVehicle(const FControlSnapshot& Snapshot)
+{
+	if (!ChaosVehicleMovement) return;
+
+	float ThrottleCmd = FMath::Clamp(Snapshot.Throttle, 0.0f, MaxThrottle);
+	float BrakeCmd = FMath::Clamp(Snapshot.Brake, 0.0f, MaxBrake);
+	float SteeringCmd = FMath::Clamp(Snapshot.SteeringAngle, -1.0f, 1.0f);
+
+	ChaosVehicleMovement->SetThrottleInput(ThrottleCmd);
+	ChaosVehicleMovement->SetBrakeInput(BrakeCmd);
+	ChaosVehicleMovement->SetSteeringInput(SteeringCmd);
+
+	if (Snapshot.Handbrake > 0)
+	{
+		ChaosVehicleMovement->SetHandbrakeInput(true);
+	}
+	else
+	{
+		ChaosVehicleMovement->SetHandbrakeInput(false);
+	}
+
+	if (Snapshot.Gear != 0 && ChaosVehicleMovement->GetTargetGear() != Snapshot.Gear)
+	{
+		ChaosVehicleMovement->SetTargetGear(Snapshot.Gear);
+	}
 }
 
 void AAVSandboxVehiclePawn::ApplyControlToChaosVehicle(const FVehicleControlMessage& Control)
@@ -95,6 +144,72 @@ void AAVSandboxVehiclePawn::ApplyControlToChaosVehicle(const FVehicleControlMess
 	}
 }
 
+void AAVSandboxVehiclePawn::SetTimeDilation(float Dilation)
+{
+	TargetTimeDilation = FMath::Max(Dilation, 0.1f);
+
+	if (StateInterpolator)
+	{
+		StateInterpolator->SetTimeDilation(TargetTimeDilation);
+	}
+
+	ConfigurePhysicsForTimeDilation(TargetTimeDilation);
+
+	EffectiveTimeDilation = TargetTimeDilation;
+
+	UE_LOG(LogTemp, Log, TEXT("[AVSandboxVehicle] TimeDilation set to %.2f"), TargetTimeDilation);
+}
+
+void AAVSandboxVehiclePawn::ConfigurePhysicsForTimeDilation(float Dilation)
+{
+	if (!bAutoConfigurePhysicsSubstep || !ChaosVehicleMovement) return;
+
+	float AdjustedSubstepDt = BaseSubstepDeltaTime / Dilation;
+	int32 RequiredSubsteps = FMath::CeilToInt(Dilation);
+
+	int32 FinalSubsteps = FMath::Min(RequiredSubsteps, MaxSubsteps);
+
+	if (ChaosVehicleMovement)
+	{
+		ChaosVehicleMovement->MaxEngineRPM = ChaosVehicleMovement->MaxEngineRPM;
+	}
+
+	UPhysicsSettings* PhysSettings = UPhysicsSettings::Get();
+	if (PhysSettings)
+	{
+		PhysSettings->MaxSubstepDeltaTime = AdjustedSubstepDt;
+		PhysSettings->MaxSubsteps = FinalSubsteps;
+		PhysSettings->bSubstepping = true;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("[AVSandboxVehicle] Physics configured for %.1fx: substep_dt=%.5f, max_substeps=%d"),
+		Dilation, AdjustedSubstepDt, FinalSubsteps);
+}
+
+FVector AAVSandboxVehiclePawn::ApplyExponentialSmoothing(
+	const FVector& Raw,
+	const FVector& Previous,
+	float Alpha)
+{
+	return Alpha * Raw + (1.0f - Alpha) * Previous;
+}
+
+FVector AAVSandboxVehiclePawn::ClampStateJump(
+	const FVector& Current,
+	const FVector& Previous,
+	float MaxDelta)
+{
+	FVector Delta = Current - Previous;
+	float DeltaMag = Delta.Size();
+
+	if (DeltaMag > MaxDelta && DeltaMag > KINDA_SMALL_NUMBER)
+	{
+		return Previous + Delta.GetSafeNormal() * MaxDelta;
+	}
+
+	return Current;
+}
+
 void AAVSandboxVehiclePawn::UpdateAcceleration(float DeltaSeconds)
 {
 	FVector CurrentVel = GetVelocity();
@@ -103,6 +218,21 @@ void AAVSandboxVehiclePawn::UpdateAcceleration(float DeltaSeconds)
 		CurrentAcceleration = (CurrentVel - PreviousVelocity) / DeltaSeconds;
 	}
 	PreviousVelocity = CurrentVel;
+}
+
+void AAVSandboxVehiclePawn::UpdateDeadReckoning(float DeltaSeconds)
+{
+	if (!StateInterpolator) return;
+
+	FVector CurrentPos = GetActorLocation();
+	FVector CurrentVel = GetVelocity();
+
+	StateInterpolator->UpdateDeadReckoning(
+		CurrentPos,
+		CurrentVel,
+		CurrentAcceleration,
+		ChaosVehicleMovement ? ChaosVehicleMovement->GetSteeringInput() : 0.0f,
+		GetWorld()->GetTimeSeconds());
 }
 
 void AAVSandboxVehiclePawn::UpdateCollisionState(float DeltaSeconds)
@@ -200,24 +330,48 @@ FVehicleStateMessage AAVSandboxVehiclePawn::BuildStateMessage(float DeltaSeconds
 {
 	FVehicleStateMessage State;
 
-	FTransform Transform = GetActorTransform();
-	FVector Location = Transform.GetTranslation();
-	FRotator Rotation = Transform.GetRotation().Rotator();
+	FVector RawLocation = GetActorLocation();
+	FVector RawVelocity = GetVelocity();
 
-	State.PositionX = Location.X;
-	State.PositionY = Location.Y;
-	State.PositionZ = Location.Z;
+	if (!bHasLastReportedState)
+	{
+		SmoothedPosition = RawLocation;
+		SmoothedVelocity = RawVelocity;
+		bHasLastReportedState = true;
+	}
+	else
+	{
+		FVector ClampedPosition = ClampStateJump(
+			RawLocation, SmoothedPosition, MaxPositionJumpThreshold * EffectiveTimeDilation);
 
-	State.RotationPitch = Rotation.Pitch;
-	State.RotationYaw = Rotation.Yaw;
-	State.RotationRoll = Rotation.Roll;
+		SmoothedPosition = ApplyExponentialSmoothing(
+			ClampedPosition, SmoothedPosition, StateSmoothingFactor);
 
-	FVector Velocity = GetVelocity();
-	State.VelocityX = Velocity.X;
-	State.VelocityY = Velocity.Y;
-	State.VelocityZ = Velocity.Z;
+		FVector ClampedVelocity = ClampStateJump(
+			RawVelocity, SmoothedVelocity, MaxVelocityJumpThreshold * EffectiveTimeDilation);
 
-	FVector AngVel = GetActorRotation().Vector();
+		SmoothedVelocity = ApplyExponentialSmoothing(
+			ClampedVelocity, SmoothedVelocity, StateSmoothingFactor);
+	}
+
+	FVector ReportPosition = SmoothedPosition;
+	FVector ReportVelocity = SmoothedVelocity;
+
+	FRotator RawRotation = GetActorRotation();
+
+	State.PositionX = ReportPosition.X;
+	State.PositionY = ReportPosition.Y;
+	State.PositionZ = ReportPosition.Z;
+
+	State.RotationPitch = RawRotation.Pitch;
+	State.RotationYaw = RawRotation.Yaw;
+	State.RotationRoll = RawRotation.Roll;
+
+	State.VelocityX = ReportVelocity.X;
+	State.VelocityY = ReportVelocity.Y;
+	State.VelocityZ = ReportVelocity.Z;
+
+	FVector AngVel = RawRotation.Vector();
 	State.AngularVelocityX = AngVel.X;
 	State.AngularVelocityY = AngVel.Y;
 	State.AngularVelocityZ = AngVel.Z;
@@ -226,9 +380,9 @@ FVehicleStateMessage AAVSandboxVehiclePawn::BuildStateMessage(float DeltaSeconds
 	FVector RightVec = GetActorRightVector();
 	FVector UpVec = GetActorUpVector();
 
-	State.ForwardSpeed = FVector::DotProduct(Velocity, ForwardVec);
-	State.LateralSpeed = FVector::DotProduct(Velocity, RightVec);
-	State.UpSpeed = FVector::DotProduct(Velocity, UpVec);
+	State.ForwardSpeed = FVector::DotProduct(ReportVelocity, ForwardVec);
+	State.LateralSpeed = FVector::DotProduct(ReportVelocity, RightVec);
+	State.UpSpeed = FVector::DotProduct(ReportVelocity, UpVec);
 
 	State.AccelerationX = CurrentAcceleration.X;
 	State.AccelerationY = CurrentAcceleration.Y;
@@ -268,6 +422,9 @@ FVehicleStateMessage AAVSandboxVehiclePawn::BuildStateMessage(float DeltaSeconds
 	uint32 Ticks = FDateTime::UtcNow().GetTicks() / ETimespan::TicksPerMillisecond;
 	State.Timestamp = Ticks & 0xFFFFFFFF;
 
+	LastReportedPosition = ReportPosition;
+	LastReportedVelocity = ReportVelocity;
+
 	return State;
 }
 
@@ -276,6 +433,7 @@ FVehicleStateMessage AAVSandboxVehiclePawn::CaptureState(float DeltaSeconds)
 	UpdateAcceleration(DeltaSeconds);
 	UpdateCollisionState(DeltaSeconds);
 	UpdateLanePosition();
+	UpdateDeadReckoning(DeltaSeconds);
 
 	CurrentState = BuildStateMessage(DeltaSeconds);
 	return CurrentState;
@@ -296,6 +454,25 @@ void AAVSandboxVehiclePawn::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
+	EffectiveTimeDilation = GetWorld()->GetTimeSeconds() > 0
+		? FMath::Max(GetActorTimeDilation(), 0.1f)
+		: TargetTimeDilation;
+
+	if (StateInterpolator)
+	{
+		double CurrentSimTime = GetWorld()->GetTimeSeconds();
+		FControlSnapshot InterpolatedControl = StateInterpolator->GetInterpolatedControl(CurrentSimTime);
+
+		CurrentControl.Throttle = InterpolatedControl.Throttle;
+		CurrentControl.Brake = InterpolatedControl.Brake;
+		CurrentControl.SteeringAngle = InterpolatedControl.SteeringAngle;
+		CurrentControl.Gear = InterpolatedControl.Gear;
+		CurrentControl.Handbrake = InterpolatedControl.Handbrake;
+		ControlSequenceNumber = InterpolatedControl.SequenceNumber;
+
+		ApplySmoothedControlToChaosVehicle(InterpolatedControl);
+	}
+
 	CaptureState(DeltaSeconds);
 
 	if (bSendStateEveryTick)
@@ -311,6 +488,15 @@ void AAVSandboxVehiclePawn::ResetVehicle(const FTransform& NewTransform)
 	PreviousVelocity = FVector::ZeroVector;
 	CurrentAcceleration = FVector::ZeroVector;
 	bIsCollisionDetected = false;
+	bHasLastReportedState = false;
+
+	SmoothedPosition = NewTransform.GetTranslation();
+	SmoothedVelocity = FVector::ZeroVector;
+
+	if (StateInterpolator)
+	{
+		StateInterpolator->Reset();
+	}
 
 	if (ChaosVehicleMovement)
 	{

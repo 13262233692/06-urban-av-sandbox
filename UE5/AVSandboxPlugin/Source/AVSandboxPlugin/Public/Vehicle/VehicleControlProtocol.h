@@ -11,7 +11,7 @@ struct FVehicleControlMessage
 	GENERATED_BODY()
 
 	static constexpr uint32 MAGIC = 0x41564354;
-	static constexpr uint16 VERSION = 1;
+	static constexpr uint16 VERSION = 2;
 
 	UPROPERTY(VisibleAnywhere) uint32 Magic = MAGIC;
 	UPROPERTY(VisibleAnywhere) uint16 Version = VERSION;
@@ -23,10 +23,12 @@ struct FVehicleControlMessage
 	UPROPERTY(VisibleAnywhere) uint8 Handbrake = 0;
 	UPROPERTY(VisibleAnywhere) uint8 Reserved1 = 0;
 	UPROPERTY(VisibleAnywhere) uint8 Reserved2 = 0;
+	UPROPERTY(VisibleAnywhere) double SimTimestamp = 0.0;
+	UPROPERTY(VisibleAnywhere) float TimeDilation = 1.0f;
 	UPROPERTY(VisibleAnywhere) uint32 Timestamp = 0;
 	UPROPERTY(VisibleAnywhere) uint32 Checksum = 0;
 
-	static constexpr int32 SERIALIZED_SIZE = 4 + 2 + 2 + 4 + 4 + 4 + 1 + 1 + 1 + 1 + 4 + 4;
+	static constexpr int32 SERIALIZED_SIZE = 4 + 2 + 2 + 4 + 4 + 4 + 1 + 1 + 1 + 1 + 8 + 4 + 4 + 4;
 
 	bool IsValid() const
 	{
